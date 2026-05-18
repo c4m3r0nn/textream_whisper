@@ -864,6 +864,46 @@ struct NotchOverlayView: View {
         }
     }
 
+    // MARK: - Engine Status Badge
+
+    private var engineStatusBadge: some View {
+        let status = speechRecognizer.engineStatus
+        let engine = NotchSettings.shared.speechEngine
+
+        let color: Color = {
+            switch status {
+            case .idle:       return .white.opacity(0.4)
+            case .connecting: return .yellow.opacity(0.8)
+            case .connected:  return .green
+            case .error:      return .red
+            }
+        }()
+
+        let icon: String = {
+            switch engine {
+            case .openaiRealtime: return "cloud.bolt.fill"
+            case .localWhisper:   return "desktopcomputer"
+            case .apple:          return "apple.logo"
+            }
+        }()
+
+        return HStack(spacing: 3) {
+            Circle()
+                .fill(color)
+                .frame(width: 6, height: 6)
+            Image(systemName: icon)
+                .font(.system(size: 8, weight: .semibold))
+                .foregroundStyle(.white.opacity(0.6))
+        }
+        .frame(height: 24)
+        .padding(.horizontal, 6)
+        .background(
+            Capsule()
+                .fill(.white.opacity(0.1))
+        )
+        .help(speechRecognizer.engineStatusLabel)
+    }
+
     private var prompterView: some View {
         VStack(spacing: 0) {
             SpeechScrollView(
@@ -985,6 +1025,11 @@ struct NotchOverlayView: View {
                             .clipShape(Circle())
                     }
                     .buttonStyle(.plain)
+                }
+
+                // Engine status badge (only for Whisper engines)
+                if NotchSettings.shared.speechEngine != .apple && listeningMode != .classic {
+                    engineStatusBadge
                 }
 
                 Button {
@@ -1466,6 +1511,11 @@ struct FloatingOverlayView: View {
                         .buttonStyle(.plain)
                     }
 
+                    // Engine status badge (only for Whisper engines)
+                    if NotchSettings.shared.speechEngine != .apple && listeningMode != .classic {
+                        floatingEngineStatusBadge
+                    }
+
                     Button {
                         speechRecognizer.forceStop()
                         speechRecognizer.shouldDismiss = true
@@ -1484,6 +1534,46 @@ struct FloatingOverlayView: View {
             .padding(.horizontal, 16)
             .padding(.bottom, 12)
         }
+    }
+
+    // MARK: - Floating Engine Status Badge
+
+    private var floatingEngineStatusBadge: some View {
+        let status = speechRecognizer.engineStatus
+        let engine = NotchSettings.shared.speechEngine
+
+        let color: Color = {
+            switch status {
+            case .idle:       return .white.opacity(0.4)
+            case .connecting: return .yellow.opacity(0.8)
+            case .connected:  return .green
+            case .error:      return .red
+            }
+        }()
+
+        let icon: String = {
+            switch engine {
+            case .openaiRealtime: return "cloud.bolt.fill"
+            case .localWhisper:   return "desktopcomputer"
+            case .apple:          return "apple.logo"
+            }
+        }()
+
+        return HStack(spacing: 3) {
+            Circle()
+                .fill(color)
+                .frame(width: 6, height: 6)
+            Image(systemName: icon)
+                .font(.system(size: 8, weight: .semibold))
+                .foregroundStyle(.white.opacity(0.6))
+        }
+        .frame(height: 24)
+        .padding(.horizontal, 6)
+        .background(
+            Capsule()
+                .fill(.white.opacity(0.1))
+        )
+        .help(speechRecognizer.engineStatusLabel)
     }
 
     private func startCountdown() {

@@ -698,6 +698,7 @@ struct SettingsView: View {
                     Button {
                         withAnimation(.easeInOut(duration: 0.2)) {
                             settings.speechEngine = engine
+                            connectionTestStatus = nil
                         }
                     } label: {
                         HStack(spacing: 10) {
@@ -764,6 +765,40 @@ struct SettingsView: View {
                     Text("Stored securely in macOS Keychain.")
                         .font(.system(size: 10))
                         .foregroundStyle(.tertiary)
+
+                    // Connection test
+                    HStack(spacing: 8) {
+                        Button {
+                            testOpenAIConnection()
+                        } label: {
+                            HStack(spacing: 4) {
+                                if isTestingConnection {
+                                    ProgressView()
+                                        .controlSize(.small)
+                                } else {
+                                    Image(systemName: "bolt.horizontal.circle")
+                                        .font(.system(size: 11))
+                                }
+                                Text("Test Connection")
+                                    .font(.system(size: 11, weight: .medium))
+                            }
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                        .disabled(isTestingConnection || settings.openAIApiKey.isEmpty)
+
+                        if let status = connectionTestStatus {
+                            HStack(spacing: 4) {
+                                Circle()
+                                    .fill(status.isSuccess ? Color.green : Color.red)
+                                    .frame(width: 8, height: 8)
+                                Text(status.message)
+                                    .font(.system(size: 11))
+                                    .foregroundStyle(status.isSuccess ? .green : .red)
+                            }
+                        }
+                    }
+                    .padding(.top, 4)
                 }
             }
 
@@ -800,6 +835,40 @@ struct SettingsView: View {
                         RoundedRectangle(cornerRadius: 6)
                             .fill(Color.primary.opacity(0.04))
                     )
+
+                    // Connection test
+                    HStack(spacing: 8) {
+                        Button {
+                            testLocalWhisperConnection()
+                        } label: {
+                            HStack(spacing: 4) {
+                                if isTestingConnection {
+                                    ProgressView()
+                                        .controlSize(.small)
+                                } else {
+                                    Image(systemName: "bolt.horizontal.circle")
+                                        .font(.system(size: 11))
+                                }
+                                Text("Test Connection")
+                                    .font(.system(size: 11, weight: .medium))
+                            }
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                        .disabled(isTestingConnection)
+
+                        if let status = connectionTestStatus {
+                            HStack(spacing: 4) {
+                                Circle()
+                                    .fill(status.isSuccess ? Color.green : Color.red)
+                                    .frame(width: 8, height: 8)
+                                Text(status.message)
+                                    .font(.system(size: 11))
+                                    .foregroundStyle(status.isSuccess ? .green : .red)
+                            }
+                        }
+                    }
+                    .padding(.top, 4)
                 }
             }
 
@@ -896,6 +965,68 @@ struct SettingsView: View {
 
     @State private var availableMics: [AudioInputDevice] = []
     @State private var isShowingApiKey: Bool = false
+    @State private var isTestingConnection: Bool = false
+    @State private var connectionTestStatus: (isSuccess: Bool, message: String)?
+
+    private func testOpenAIConnection() {
+        isTestingConnection = true
+        connectionTestStatus = nil
+        let apiKey = settings.openAIApiKey
+
+        Task { @MainActor in
+            do {
+                guard !apiKey.isEmpty else {
+                    connectionTestStatus = (false, "No API key set")
+                    isTestingConnection = false
+                    return
+                }
+
+                var request = URLRequest(url: URL(string: "https://api.openai.com/v1/models")!)
+                request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+                request.timeoutInterval = 10
+
+                let (data, response) = try await URLSession.shared.data(for: request)
+                let httpResp = response as? HTTPURLResponse
+
+                if httpResp?.statusCode == 200 {
+                    connectionTestStatus = (true, "Connected — API key valid")
+                } else if httpResp?.statusCode == 401 {
+                    connectionTestStatus = (false, "Invalid API key")
+                } else {
+                    connectionTestStatus = (false, "HTTP \(httpResp?.statusCode ?? 0)")
+                }
+            } catch {
+                connectionTestStatus = (false, error.localizedDescription)
+            }
+            isTestingConnection = false
+        }
+    }
+
+    private func testLocalWhisperConnection() {
+        isTestingConnection = true
+        connectionTestStatus = nil
+        let serverURL = settings.localWhisperServerURL
+
+        Task { @MainActor in
+            do {
+                let url = URL(string: "\(serverURL)/v1/models")!
+                var request = URLRequest(url: url)
+                request.timeoutInterval = 5
+
+                let (_, response) = try await URLSession.shared.data(for: request)
+                let httpResp = response as? HTTPURLResponse
+
+                if httpResp?.statusCode == 200 {
+                    connectionTestStatus = (true, "Connected — server running")
+                } else {
+                    connectionTestStatus = (false, "Server responded HTTP \(httpResp?.statusCode ?? 0)")
+                }
+            } catch {
+                connectionTestStatus = (false, "Not reachable — is whisper-server running?")
+            }
+            isTestingConnection = false
+        }
+    }
 
     // MARK: - Teleprompter Tab
 

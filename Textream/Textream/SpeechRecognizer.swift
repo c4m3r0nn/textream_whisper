@@ -80,6 +80,47 @@ class SpeechRecognizer {
     var shouldDismiss: Bool = false
     var shouldAdvancePage: Bool = false
 
+    // MARK: - Engine status
+    enum EngineStatus {
+        case idle          // Not started
+        case connecting    // Attempting to connect
+        case connected     // Receiving transcriptions
+        case error         // Something went wrong
+    }
+
+    var engineStatus: EngineStatus = .idle
+    var engineError: String?
+
+    var engineStatusLabel: String {
+        switch NotchSettings.shared.speechEngine {
+        case .apple:
+            return isListening ? "Apple STT" : "Apple STT (off)"
+        case .openaiRealtime:
+            switch engineStatus {
+            case .idle:       return "Whisper (idle)"
+            case .connecting: return "Whisper (connecting…)"
+            case .connected:  return "Whisper (live)"
+            case .error:      return "Whisper (error)"
+            }
+        case .localWhisper:
+            switch engineStatus {
+            case .idle:       return "Local Whisper (idle)"
+            case .connecting: return "Local Whisper (checking…)"
+            case .connected:  return "Local Whisper (live)"
+            case .error:      return "Local Whisper (error)"
+            }
+        }
+    }
+
+    var isEngineConnected: Bool {
+        switch NotchSettings.shared.speechEngine {
+        case .apple:
+            return isListening
+        case .openaiRealtime, .localWhisper:
+            return engineStatus == .connected
+        }
+    }
+
     /// True when recent audio levels indicate the user is actively speaking
     var isSpeaking: Bool {
         let recent = audioLevels.suffix(10)
@@ -220,8 +261,13 @@ class SpeechRecognizer {
         let apiKey = NotchSettings.shared.openAIApiKey
         guard !apiKey.isEmpty else {
             error = "OpenAI API key is required. Set it in Settings → Guidance."
+            engineStatus = .error
+            engineError = "Missing API key"
             return
         }
+
+        engineStatus = .connecting
+        engineError = nil
 
         let client = WhisperRealtimeClient()
         whisperRealtimeClient = client
@@ -229,7 +275,8 @@ class SpeechRecognizer {
 
         client.onTranscription = { [weak self] transcript in
             guard let self else { return }
-            // Accumulate transcripts across turns
+            self.engineStatus = .connected
+            self.engineError = nil
             if self.whisperTranscriptAccumulator.isEmpty {
                 self.whisperTranscriptAccumulator = transcript
             } else {
@@ -239,16 +286,28 @@ class SpeechRecognizer {
             self.matchCharacters(spoken: self.whisperTranscriptAccumulator)
         }
 
-        client.onSpeechStopped = { [weak self] in
-            // When a speech turn ends, reset the accumulator but keep matchStartOffset
-            // so the next turn's transcript is matched relative to current progress
+        client.onConnectionChange = { [weak self] connected in
+            guard let self else { return }
+            if connected {
+                self.engineStatus = .connected
+                self.engineError = nil
+            } else {
+                if self.isListening {
+                    self.engineStatus = .error
+                    self.engineError = "Connection lost"
+                }
+            }
         }
 
         Task { @MainActor [weak self] in
             do {
                 try await client.connect(apiKey: apiKey, language: "")
+                self?.engineStatus = .connected
+                self?.engineError = nil
                 self?.startAudioCapture(forWhisper: true)
             } catch {
+                self?.engineStatus = .error
+                self?.engineError = error.localizedDescription
                 self?.error = "Failed to connect to OpenAI: \(error.localizedDescription)"
             }
         }
@@ -262,9 +321,13 @@ class SpeechRecognizer {
         localWhisperClient = client
         client.configure(serverURL: serverURL)
         whisperTranscriptAccumulator = ""
+        engineStatus = .connecting
+        engineError = nil
 
         client.onTranscription = { [weak self] transcript in
             guard let self else { return }
+            self.engineStatus = .connected
+            self.engineError = nil
             self.whisperTranscriptAccumulator += " " + transcript
             self.lastSpokenText = String(self.whisperTranscriptAccumulator.trimmingCharacters(in: .whitespaces))
             self.matchCharacters(spoken: self.lastSpokenText)
@@ -274,11 +337,17 @@ class SpeechRecognizer {
             do {
                 let reachable = try await client.checkServer()
                 if !reachable {
+                    self?.engineStatus = .error
+                    self?.engineError = "Server not reachable at \(serverURL)"
                     self?.error = "Whisper server not reachable at \(serverURL). Start it with: whisper-server -m model.bin --port 8099"
                     return
                 }
+                self?.engineStatus = .connected
+                self?.engineError = nil
                 self?.startAudioCapture(forWhisper: false)
             } catch {
+                self?.engineStatus = .error
+                self?.engineError = error.localizedDescription
                 self?.error = "Cannot reach Whisper server: \(error.localizedDescription)\nStart it with: whisper-server -m model.bin --port 8099"
             }
         }
@@ -446,6 +515,8 @@ class SpeechRecognizer {
         localWhisperClient?.reset()
         localWhisperClient = nil
         whisperTranscriptAccumulator = ""
+        engineStatus = .idle
+        engineError = nil
     }
 
     /// Coalesces all delayed beginRecognition() calls into a single pending work item.
