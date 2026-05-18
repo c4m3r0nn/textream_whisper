@@ -281,6 +281,38 @@ enum MirrorAxis: String, CaseIterable, Identifiable {
     }
 }
 
+// MARK: - Speech Engine
+
+enum SpeechEngine: String, CaseIterable, Identifiable {
+    case apple, openaiRealtime, localWhisper
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .apple:          return "Apple (Built-in)"
+        case .openaiRealtime: return "OpenAI Whisper"
+        case .localWhisper:   return "Local Whisper"
+        }
+    }
+
+    var description: String {
+        switch self {
+        case .apple:          return "Uses macOS built-in speech recognition. Works offline, no configuration needed."
+        case .openaiRealtime: return "Uses OpenAI's Realtime transcription API via streaming WebSocket. Requires an API key."
+        case .localWhisper:   return "Uses a local whisper.cpp server running on this Mac. Requires whisper-server to be running."
+        }
+    }
+
+    var icon: String {
+        switch self {
+        case .apple:          return "apple.logo"
+        case .openaiRealtime: return "cloud.bolt.fill"
+        case .localWhisper:   return "desktopcomputer"
+        }
+    }
+}
+
 // MARK: - Listening Mode
 
 enum ListeningMode: String, CaseIterable, Identifiable {
@@ -449,6 +481,22 @@ class NotchSettings {
         didSet { UserDefaults.standard.set(Int(directorServerPort), forKey: "directorServerPort") }
     }
 
+    // MARK: - Speech Engine Settings
+
+    var speechEngine: SpeechEngine {
+        didSet { UserDefaults.standard.set(speechEngine.rawValue, forKey: "speechEngine") }
+    }
+
+    /// OpenAI API key, stored in Keychain for security
+    var openAIApiKey: String {
+        didSet { KeychainHelper.save(key: "openAIApiKey", value: openAIApiKey) }
+    }
+
+    /// Local whisper.cpp server URL (e.g. "http://localhost:8099")
+    var localWhisperServerURL: String {
+        didSet { UserDefaults.standard.set(localWhisperServerURL, forKey: "localWhisperServerURL") }
+    }
+
     var font: NSFont {
         fontFamilyPreset.font(size: fontSizePreset.pointSize)
     }
@@ -505,5 +553,8 @@ class NotchSettings {
         self.directorModeEnabled = UserDefaults.standard.object(forKey: "directorModeEnabled") as? Bool ?? false
         let savedDirectorPort = UserDefaults.standard.integer(forKey: "directorServerPort")
         self.directorServerPort = savedDirectorPort > 0 ? UInt16(savedDirectorPort) : 7575
+        self.speechEngine = SpeechEngine(rawValue: UserDefaults.standard.string(forKey: "speechEngine") ?? "") ?? .apple
+        self.openAIApiKey = KeychainHelper.load(key: "openAIApiKey") ?? ""
+        self.localWhisperServerURL = UserDefaults.standard.string(forKey: "localWhisperServerURL") ?? "http://localhost:8099"
     }
 }

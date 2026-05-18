@@ -32,3 +32,16 @@ Pods/
 *~
 *.orig
 *.log
+
+# Environment & API keys
+.env
+.env.local
+.env.production
+*.env
+credentials.json
+secrets.json
+api-keys.*
+
+# Whisper model files (large binaries)
+*.bin
+models/

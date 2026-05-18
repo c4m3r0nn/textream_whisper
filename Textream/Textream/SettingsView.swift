@@ -687,7 +687,124 @@ struct SettingsView: View {
     // MARK: - Guidance Tab
 
     private var guidanceTab: some View {
+        ScrollView(.vertical, showsIndicators: false) {
         VStack(alignment: .leading, spacing: 14) {
+            // Speech Engine
+            Text("Speech Engine")
+                .font(.system(size: 13, weight: .semibold))
+
+            VStack(spacing: 8) {
+                ForEach(SpeechEngine.allCases) { engine in
+                    Button {
+                        withAnimation(.easeInOut(duration: 0.2)) {
+                            settings.speechEngine = engine
+                        }
+                    } label: {
+                        HStack(spacing: 10) {
+                            Image(systemName: engine.icon)
+                                .font(.system(size: 14, weight: .medium))
+                                .foregroundStyle(settings.speechEngine == engine ? Color.accentColor : .secondary)
+                                .frame(width: 20)
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(engine.label)
+                                    .font(.system(size: 12, weight: .medium))
+                                    .foregroundStyle(settings.speechEngine == engine ? Color.accentColor : .primary)
+                                Text(engine.description)
+                                    .font(.system(size: 10))
+                                    .foregroundStyle(.secondary)
+                                    .lineLimit(2)
+                            }
+                            Spacer()
+                            if settings.speechEngine == engine {
+                                Image(systemName: "checkmark.circle.fill")
+                                    .font(.system(size: 14))
+                                    .foregroundStyle(Color.accentColor)
+                            }
+                        }
+                        .padding(10)
+                        .background(
+                            RoundedRectangle(cornerRadius: 8)
+                                .fill(settings.speechEngine == engine ? Color.accentColor.opacity(0.1) : Color.primary.opacity(0.04))
+                        )
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 8)
+                                .strokeBorder(settings.speechEngine == engine ? Color.accentColor.opacity(0.4) : Color.clear, lineWidth: 1.5)
+                        )
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+
+            // OpenAI API Key
+            if settings.speechEngine == .openaiRealtime {
+                Divider()
+
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("OpenAI API Key")
+                        .font(.system(size: 13, weight: .medium))
+                    HStack {
+                        if isShowingApiKey {
+                            TextField("sk-...", text: $settings.openAIApiKey)
+                                .textFieldStyle(.roundedBorder)
+                                .font(.system(size: 12, design: .monospaced))
+                        } else {
+                            SecureField("sk-...", text: $settings.openAIApiKey)
+                                .textFieldStyle(.roundedBorder)
+                                .font(.system(size: 12, design: .monospaced))
+                        }
+                        Button {
+                            isShowingApiKey.toggle()
+                        } label: {
+                            Image(systemName: isShowingApiKey ? "eye.slash" : "eye")
+                                .font(.system(size: 11))
+                        }
+                        .buttonStyle(.plain)
+                        .foregroundStyle(.secondary)
+                    }
+                    Text("Stored securely in macOS Keychain.")
+                        .font(.system(size: 10))
+                        .foregroundStyle(.tertiary)
+                }
+            }
+
+            // Local Whisper Server URL
+            if settings.speechEngine == .localWhisper {
+                Divider()
+
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("Whisper Server URL")
+                        .font(.system(size: 13, weight: .medium))
+                    TextField("http://localhost:8099", text: $settings.localWhisperServerURL)
+                        .textFieldStyle(.roundedBorder)
+                        .font(.system(size: 12, design: .monospaced))
+
+                    VStack(alignment: .leading, spacing: 4) {
+                        HStack(spacing: 6) {
+                            Image(systemName: "info.circle")
+                                .font(.system(size: 11))
+                                .foregroundStyle(.secondary)
+                            Text("Install and start the server:")
+                                .font(.system(size: 10))
+                                .foregroundStyle(.secondary)
+                        }
+                        Text("brew install whisper-cpp")
+                            .font(.system(size: 10, weight: .medium, design: .monospaced))
+                            .foregroundStyle(.secondary)
+                        Text("whisper-server -m model.bin --port 8099")
+                            .font(.system(size: 10, weight: .medium, design: .monospaced))
+                            .foregroundStyle(.secondary)
+                    }
+                    .padding(8)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(
+                        RoundedRectangle(cornerRadius: 6)
+                            .fill(Color.primary.opacity(0.04))
+                    )
+                }
+            }
+
+            Divider()
+
             Picker("", selection: $settings.listeningMode) {
                 ForEach(ListeningMode.allCases) { mode in
                     Text(mode.label).tag(mode)
@@ -701,18 +818,27 @@ struct SettingsView: View {
                 .foregroundStyle(.secondary)
 
             if settings.listeningMode == .wordTracking {
-                Divider()
-
-                VStack(alignment: .leading, spacing: 6) {
-                    Text("Speech Language")
-                        .font(.system(size: 13, weight: .medium))
-                    Picker("", selection: $settings.speechLocale) {
-                        ForEach(SFSpeechRecognizer.supportedLocales().sorted(by: { $0.identifier < $1.identifier }), id: \.identifier) { locale in
-                            Text(Locale.current.localizedString(forIdentifier: locale.identifier) ?? locale.identifier)
-                                .tag(locale.identifier)
+                if settings.speechEngine == .apple {
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("Speech Language")
+                            .font(.system(size: 13, weight: .medium))
+                        Picker("", selection: $settings.speechLocale) {
+                            ForEach(SFSpeechRecognizer.supportedLocales().sorted(by: { $0.identifier < $1.identifier }), id: \.identifier) { locale in
+                                Text(Locale.current.localizedString(forIdentifier: locale.identifier) ?? locale.identifier)
+                                    .tag(locale.identifier)
+                            }
                         }
+                        .labelsHidden()
                     }
-                    .labelsHidden()
+                } else {
+                    HStack(spacing: 6) {
+                        Image(systemName: "info.circle")
+                            .font(.system(size: 11))
+                            .foregroundStyle(.secondary)
+                        Text("Whisper auto-detects language.")
+                            .font(.system(size: 11))
+                            .foregroundStyle(.secondary)
+                    }
                 }
             }
 
@@ -764,10 +890,12 @@ struct SettingsView: View {
             Spacer()
         }
         .padding(16)
+        }
         .onAppear { availableMics = AudioInputDevice.allInputDevices() }
     }
 
     @State private var availableMics: [AudioInputDevice] = []
+    @State private var isShowingApiKey: Bool = false
 
     // MARK: - Teleprompter Tab
 

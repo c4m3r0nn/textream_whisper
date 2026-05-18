@@ -107,6 +107,11 @@ class SpeechRecognizer {
     /// We require 2-of-3 recent results to agree before committing a forward jump.
     private var recentMatchPositions: [Int] = []
 
+    // MARK: - Whisper backend state
+    private var whisperRealtimeClient: WhisperRealtimeClient?
+    private var localWhisperClient: LocalWhisperClient?
+    private var whisperTranscriptAccumulator: String = ""
+
     /// Update the source text while preserving the current recognized char count.
     /// Used by Director Mode to live-edit unread text without resetting read progress.
     func updateText(_ text: String, preservingCharCount: Int) {
@@ -125,8 +130,13 @@ class SpeechRecognizer {
         matchStartOffset = charOffset
         retryCount = 0
         recentMatchPositions = []
+        whisperTranscriptAccumulator = ""
         if isListening {
-            restartRecognition()
+            if NotchSettings.shared.speechEngine == .apple {
+                restartRecognition()
+            } else {
+                // For Whisper backends, just update the offset - audio keeps flowing
+            }
         }
     }
 
@@ -156,7 +166,7 @@ class SpeechRecognizer {
             AVCaptureDevice.requestAccess(for: .audio) { [weak self] granted in
                 DispatchQueue.main.async {
                     if granted {
-                        self?.requestSpeechAuthAndBegin()
+                        self?.beginWithSelectedEngine()
                     } else {
                         self?.error = "Microphone access denied. Open System Settings → Privacy & Security → Microphone to allow Textream."
                     }
@@ -169,7 +179,19 @@ class SpeechRecognizer {
             break
         }
 
-        requestSpeechAuthAndBegin()
+        beginWithSelectedEngine()
+    }
+
+    /// Dispatch to the correct speech engine based on settings
+    private func beginWithSelectedEngine() {
+        switch NotchSettings.shared.speechEngine {
+        case .apple:
+            requestSpeechAuthAndBegin()
+        case .openaiRealtime:
+            beginOpenAIRealtime()
+        case .localWhisper:
+            beginLocalWhisper()
+        }
     }
 
     private func requestSpeechAuthAndBegin() {
@@ -192,6 +214,171 @@ class SpeechRecognizer {
         }
     }
 
+    // MARK: - OpenAI Realtime Backend
+
+    private func beginOpenAIRealtime() {
+        let apiKey = NotchSettings.shared.openAIApiKey
+        guard !apiKey.isEmpty else {
+            error = "OpenAI API key is required. Set it in Settings → Guidance."
+            return
+        }
+
+        let client = WhisperRealtimeClient()
+        whisperRealtimeClient = client
+        whisperTranscriptAccumulator = ""
+
+        client.onTranscription = { [weak self] transcript in
+            guard let self else { return }
+            // Accumulate transcripts across turns
+            if self.whisperTranscriptAccumulator.isEmpty {
+                self.whisperTranscriptAccumulator = transcript
+            } else {
+                self.whisperTranscriptAccumulator += " " + transcript
+            }
+            self.lastSpokenText = self.whisperTranscriptAccumulator
+            self.matchCharacters(spoken: self.whisperTranscriptAccumulator)
+        }
+
+        client.onSpeechStopped = { [weak self] in
+            // When a speech turn ends, reset the accumulator but keep matchStartOffset
+            // so the next turn's transcript is matched relative to current progress
+        }
+
+        Task { @MainActor [weak self] in
+            do {
+                try await client.connect(apiKey: apiKey, language: "")
+                self?.startAudioCapture(forWhisper: true)
+            } catch {
+                self?.error = "Failed to connect to OpenAI: \(error.localizedDescription)"
+            }
+        }
+    }
+
+    // MARK: - Local Whisper Backend
+
+    private func beginLocalWhisper() {
+        let serverURL = NotchSettings.shared.localWhisperServerURL
+        let client = LocalWhisperClient()
+        localWhisperClient = client
+        client.configure(serverURL: serverURL)
+        whisperTranscriptAccumulator = ""
+
+        client.onTranscription = { [weak self] transcript in
+            guard let self else { return }
+            self.whisperTranscriptAccumulator += " " + transcript
+            self.lastSpokenText = String(self.whisperTranscriptAccumulator.trimmingCharacters(in: .whitespaces))
+            self.matchCharacters(spoken: self.lastSpokenText)
+        }
+
+        Task { @MainActor [weak self] in
+            do {
+                let reachable = try await client.checkServer()
+                if !reachable {
+                    self?.error = "Whisper server not reachable at \(serverURL). Start it with: whisper-server -m model.bin --port 8099"
+                    return
+                }
+                self?.startAudioCapture(forWhisper: false)
+            } catch {
+                self?.error = "Cannot reach Whisper server: \(error.localizedDescription)\nStart it with: whisper-server -m model.bin --port 8099"
+            }
+        }
+    }
+
+    /// Start audio capture for Whisper backends (shared mic setup without SFSpeechRecognizer)
+    private func startAudioCapture(forWhisper isRealtime: Bool) {
+        cleanupAudioEngine()
+        audioEngine = AVAudioEngine()
+
+        // Set selected microphone if configured
+        let micUID = NotchSettings.shared.selectedMicUID
+        if !micUID.isEmpty, let deviceID = AudioInputDevice.deviceID(forUID: micUID) {
+            suppressConfigChange = true
+            if let audioUnit = audioEngine.inputNode.audioUnit {
+                var devID = deviceID
+                AudioUnitSetProperty(
+                    audioUnit,
+                    kAudioOutputUnitProperty_CurrentDevice,
+                    kAudioUnitScope_Global,
+                    0,
+                    &devID,
+                    UInt32(MemoryLayout<AudioDeviceID>.size)
+                )
+                AudioUnitUninitialize(audioUnit)
+                AudioUnitInitialize(audioUnit)
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+                self?.suppressConfigChange = false
+            }
+        }
+
+        let inputNode = audioEngine.inputNode
+        let hardwareFormat = inputNode.outputFormat(forBus: 0)
+
+        guard hardwareFormat.sampleRate > 0, hardwareFormat.channelCount > 0 else {
+            error = "Audio input unavailable"
+            return
+        }
+
+        let monoFormat = AVAudioFormat(
+            commonFormat: hardwareFormat.commonFormat,
+            sampleRate: hardwareFormat.sampleRate,
+            channels: 1,
+            interleaved: hardwareFormat.isInterleaved
+        )
+        let tapFormat = (hardwareFormat.channelCount > 1) ? monoFormat : hardwareFormat
+
+        // Observe audio configuration changes
+        configurationChangeObserver = NotificationCenter.default.addObserver(
+            forName: .AVAudioEngineConfigurationChange,
+            object: audioEngine,
+            queue: .main
+        ) { [weak self] _ in
+            guard let self, !self.suppressConfigChange, !self.sourceText.isEmpty else { return }
+            // Restart with the same engine
+            self.beginWithSelectedEngine()
+        }
+
+        inputNode.removeTap(onBus: 0)
+
+        let currentGen = sessionGeneration
+        inputNode.installTap(onBus: 0, bufferSize: 1024, format: tapFormat) { [weak self] buffer, _ in
+            guard let self, self.sessionGeneration == currentGen else { return }
+
+            // Calculate audio levels
+            guard let channelData = buffer.floatChannelData?[0] else { return }
+            let frameLength = Int(buffer.frameLength)
+            var sum: Float = 0
+            for i in 0..<frameLength {
+                sum += channelData[i] * channelData[i]
+            }
+            let rms = sqrt(sum / Float(max(frameLength, 1)))
+            let level = CGFloat(min(rms * 5, 1.0))
+
+            DispatchQueue.main.async {
+                self.audioLevels.append(level)
+                if self.audioLevels.count > 30 {
+                    self.audioLevels.removeFirst()
+                }
+            }
+
+            // Send audio to Whisper backend
+            if isRealtime {
+                self.whisperRealtimeClient?.sendAudio(buffer)
+            } else {
+                self.localWhisperClient?.processAudioBuffer(buffer)
+            }
+        }
+
+        do {
+            audioEngine.prepare()
+            try audioEngine.start()
+            isListening = true
+        } catch {
+            self.error = "Audio engine failed: \(error.localizedDescription)"
+            isListening = false
+        }
+    }
+
     private func openSpeechRecognitionSettings() {
         if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_SpeechRecognition") {
             NSWorkspace.shared.open(url)
@@ -201,6 +388,7 @@ class SpeechRecognizer {
     func stop() {
         isListening = false
         cleanupRecognition()
+        cleanupWhisper()
     }
 
     func forceStop() {
@@ -209,6 +397,7 @@ class SpeechRecognizer {
         retryCount = maxRetries
         recentMatchPositions = []
         cleanupRecognition()
+        cleanupWhisper()
     }
 
     func resume() {
@@ -216,7 +405,8 @@ class SpeechRecognizer {
         matchStartOffset = recognizedCharCount
         recentMatchPositions = []
         shouldDismiss = false
-        beginRecognition()
+        whisperTranscriptAccumulator = ""
+        beginWithSelectedEngine()
     }
 
     private func cleanupRecognitionTask() {
@@ -248,6 +438,14 @@ class SpeechRecognizer {
     private func cleanupRecognition() {
         cleanupRecognitionTask()
         cleanupAudioEngine()
+    }
+
+    private func cleanupWhisper() {
+        whisperRealtimeClient?.disconnect()
+        whisperRealtimeClient = nil
+        localWhisperClient?.reset()
+        localWhisperClient = nil
+        whisperTranscriptAccumulator = ""
     }
 
     /// Coalesces all delayed beginRecognition() calls into a single pending work item.
