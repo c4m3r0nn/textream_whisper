@@ -72,7 +72,13 @@ struct AudioInputDevice: Identifiable, Hashable {
 
 @Observable
 class SpeechRecognizer {
+    /// Displayed/visible position. Smoothly catches up to `targetCharCount`.
     var recognizedCharCount: Int = 0
+    /// Match target written by the speech-matching code. UI reads
+    /// `recognizedCharCount`; the follower advances it toward this at a
+    /// capped rate so the highlight never snaps.
+    private var targetCharCount: Int = 0
+    private var followerTimer: Timer?
     var isListening: Bool = false
     var error: String?
     var audioLevels: [CGFloat] = Array(repeating: 0, count: 30)
@@ -161,6 +167,7 @@ class SpeechRecognizer {
         sourceText = collapsed
         normalizedSource = Self.normalize(collapsed)
         recognizedCharCount = min(preservingCharCount, collapsed.count)
+        targetCharCount = recognizedCharCount
         matchStartOffset = recognizedCharCount
         recentMatchPositions = []
     }
@@ -168,6 +175,7 @@ class SpeechRecognizer {
     /// Jump highlight to a specific char offset (e.g. when user taps a word)
     func jumpTo(charOffset: Int) {
         recognizedCharCount = charOffset
+        targetCharCount = charOffset
         matchStartOffset = charOffset
         retryCount = 0
         recentMatchPositions = []
@@ -191,9 +199,11 @@ class SpeechRecognizer {
         sourceText = collapsed
         normalizedSource = Self.normalize(collapsed)
         recognizedCharCount = 0
+        targetCharCount = 0
         matchStartOffset = 0
         retryCount = 0
         recentMatchPositions = []
+        startFollowerTimer()
         error = nil
         sessionGeneration += 1
 
@@ -260,12 +270,14 @@ class SpeechRecognizer {
     private func beginOpenAIRealtime() {
         let apiKey = NotchSettings.shared.openAIApiKey
         guard !apiKey.isEmpty else {
+            print("[SpeechRecognizer] beginOpenAIRealtime aborted: no API key")
             error = "OpenAI API key is required. Set it in Settings → Guidance."
             engineStatus = .error
             engineError = "Missing API key"
             return
         }
 
+        print("[SpeechRecognizer] beginOpenAIRealtime: starting (locale=\(NotchSettings.shared.speechLocale))")
         engineStatus = .connecting
         engineError = nil
 
@@ -286,6 +298,20 @@ class SpeechRecognizer {
             self.matchCharacters(spoken: self.whisperTranscriptAccumulator)
         }
 
+        client.onPartialTranscription = { [weak self] partial in
+            guard let self else { return }
+            self.engineStatus = .connected
+            self.engineError = nil
+            let combined: String
+            if self.whisperTranscriptAccumulator.isEmpty {
+                combined = partial
+            } else {
+                combined = self.whisperTranscriptAccumulator + " " + partial
+            }
+            self.lastSpokenText = combined
+            self.matchCharacters(spoken: combined)
+        }
+
         client.onConnectionChange = { [weak self] connected in
             guard let self else { return }
             if connected {
@@ -302,10 +328,12 @@ class SpeechRecognizer {
         Task { @MainActor [weak self] in
             do {
                 try await client.connect(apiKey: apiKey, language: "")
+                print("[SpeechRecognizer] OpenAI connect succeeded — starting audio capture")
                 self?.engineStatus = .connected
                 self?.engineError = nil
                 self?.startAudioCapture(forWhisper: true)
             } catch {
+                print("[SpeechRecognizer] OpenAI connect FAILED: \(error.localizedDescription)")
                 self?.engineStatus = .error
                 self?.engineError = error.localizedDescription
                 self?.error = "Failed to connect to OpenAI: \(error.localizedDescription)"
@@ -355,6 +383,7 @@ class SpeechRecognizer {
 
     /// Start audio capture for Whisper backends (shared mic setup without SFSpeechRecognizer)
     private func startAudioCapture(forWhisper isRealtime: Bool) {
+        print("[SpeechRecognizer] startAudioCapture (isRealtime=\(isRealtime))")
         cleanupAudioEngine()
         audioEngine = AVAudioEngine()
 
@@ -384,6 +413,7 @@ class SpeechRecognizer {
         let hardwareFormat = inputNode.outputFormat(forBus: 0)
 
         guard hardwareFormat.sampleRate > 0, hardwareFormat.channelCount > 0 else {
+            print("[SpeechRecognizer] Audio input unavailable (sr=\(hardwareFormat.sampleRate) ch=\(hardwareFormat.channelCount))")
             error = "Audio input unavailable"
             return
         }
@@ -395,6 +425,7 @@ class SpeechRecognizer {
             interleaved: hardwareFormat.isInterleaved
         )
         let tapFormat = (hardwareFormat.channelCount > 1) ? monoFormat : hardwareFormat
+        print("[SpeechRecognizer] mic format: sr=\(Int(hardwareFormat.sampleRate)) ch=\(hardwareFormat.channelCount) → tap ch=\(tapFormat?.channelCount ?? 0)")
 
         // Observe audio configuration changes
         configurationChangeObserver = NotificationCenter.default.addObserver(
@@ -442,7 +473,9 @@ class SpeechRecognizer {
             audioEngine.prepare()
             try audioEngine.start()
             isListening = true
+            print("[SpeechRecognizer] audio engine started — streaming to \(isRealtime ? "OpenAI" : "local Whisper")")
         } catch {
+            print("[SpeechRecognizer] audio engine FAILED: \(error.localizedDescription)")
             self.error = "Audio engine failed: \(error.localizedDescription)"
             isListening = false
         }
@@ -454,8 +487,41 @@ class SpeechRecognizer {
         }
     }
 
+    // MARK: - Highlight follower (smooth catch-up)
+
+    private func startFollowerTimer() {
+        followerTimer?.invalidate()
+        followerTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in
+            self?.tickFollower()
+        }
+    }
+
+    private func stopFollowerTimer() {
+        followerTimer?.invalidate()
+        followerTimer = nil
+    }
+
+    /// Advance `recognizedCharCount` toward `targetCharCount` with a capped
+    /// per-tick step. The cap scales with the gap so far-behind catches up
+    /// faster than nearly-caught-up, but it never snaps.
+    private func tickFollower() {
+        let current = recognizedCharCount
+        let target = targetCharCount
+        guard current < target else { return }
+        let diff = target - current
+        let step: Int
+        switch diff {
+        case ..<6:        step = 1   // ~60 chars/s (matches normal reading)
+        case 6..<30:      step = 2   // ~120 chars/s
+        case 30..<80:     step = 4   // ~240 chars/s
+        default:          step = 6   // ~360 chars/s — far-behind catch-up
+        }
+        recognizedCharCount = min(target, current + step)
+    }
+
     func stop() {
         isListening = false
+        stopFollowerTimer()
         cleanupRecognition()
         cleanupWhisper()
     }
@@ -465,6 +531,7 @@ class SpeechRecognizer {
         sourceText = ""
         retryCount = maxRetries
         recentMatchPositions = []
+        stopFollowerTimer()
         cleanupRecognition()
         cleanupWhisper()
     }
@@ -472,9 +539,11 @@ class SpeechRecognizer {
     func resume() {
         retryCount = 0
         matchStartOffset = recognizedCharCount
+        targetCharCount = recognizedCharCount
         recentMatchPositions = []
         shouldDismiss = false
         whisperTranscriptAccumulator = ""
+        startFollowerTimer()
         beginWithSelectedEngine()
     }
 
@@ -864,36 +933,39 @@ class SpeechRecognizer {
         }
 
         let newCount = matchStartOffset + best
-        guard newCount > recognizedCharCount else { return }
+        // Compare against the matcher's last-known target (not the displayed
+        // value), so the follower-induced lag doesn't keep re-confirming the
+        // same region.
+        guard newCount > targetCharCount else { return }
 
         let candidate = min(newCount, sourceText.count)
 
-        // Confidence gating: require 2-of-3 recent results to agree on
-        // forward movement to avoid single-result false-positive jumps.
-        recentMatchPositions.append(candidate)
-        if recentMatchPositions.count > 3 {
-            recentMatchPositions.removeFirst()
-        }
-
-        // Check if at least 2 of the recent positions agree (within tolerance)
-        let agreementThreshold = 10 // characters
-        var confirmed = false
-        if recentMatchPositions.count >= 2 {
-            var agreeCount = 0
-            for pos in recentMatchPositions {
-                if abs(pos - candidate) <= agreementThreshold {
-                    agreeCount += 1
-                }
+        // Whisper transcripts are accurate enough to trust each result.
+        // Apple SFSpeechRecognizer partials can be noisy → confidence-gate them.
+        if NotchSettings.shared.speechEngine == .apple {
+            recentMatchPositions.append(candidate)
+            if recentMatchPositions.count > 3 {
+                recentMatchPositions.removeFirst()
             }
-            confirmed = agreeCount >= 2
-        }
 
-        // Small forward movements (< 1 word length) are always allowed
-        // to keep the highlight responsive for normal reading
-        let smallStep = candidate - recognizedCharCount <= 15
+            let agreementThreshold = 10 // characters
+            var confirmed = false
+            if recentMatchPositions.count >= 2 {
+                var agreeCount = 0
+                for pos in recentMatchPositions {
+                    if abs(pos - candidate) <= agreementThreshold {
+                        agreeCount += 1
+                    }
+                }
+                confirmed = agreeCount >= 2
+            }
 
-        if confirmed || smallStep {
-            recognizedCharCount = candidate
+            let smallStep = candidate - targetCharCount <= 15
+            if confirmed || smallStep {
+                targetCharCount = candidate
+            }
+        } else {
+            targetCharCount = candidate
         }
     }
 
